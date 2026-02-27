@@ -2,6 +2,7 @@ import unittest
 import pytest
 import os
 from gordian.repo import Repo
+from github import BadCredentialsException, RateLimitExceededException, UnknownObjectException, GithubException
 from unittest.mock import MagicMock, patch, call
 from gordian.files import YamlFile
 from .utils import Utils
@@ -87,6 +88,48 @@ class TestRepo(unittest.TestCase):
         self.repo._source_repo.get_contents.assert_has_calls([call('', 'target'), call('directory', 'target')])
         self.assertEqual(self.repo.files, [repository_file])
 
+    def test_get_files_bad_credentials_exception(self):
+        self.repo._set_target_branch('target')
+        self.repo.files = []
+        self.repo._source_repo = MagicMock()
+        self.repo._source_repo.get_contents.side_effect = BadCredentialsException('Bad Credentials')
+        with pytest.raises(BadCredentialsException):
+            self.repo.get_files()
+
+    def test_get_files_rate_limit_exception(self):
+        self.repo._set_target_branch('target')
+        self.repo.files = []
+        self.repo._source_repo = MagicMock()
+        self.repo._source_repo.get_contents.side_effect = RateLimitExceededException('Rate Limit Exceeded')
+        with pytest.raises(RateLimitExceededException):
+            self.repo.get_files()
+
+    def test_get_files_unknown_object_exception(self):
+        self.repo._set_target_branch('target')
+        self.repo.files = []
+        self.repo._source_repo = MagicMock()
+        self.repo._source_repo.get_contents.side_effect = UnknownObjectException('Unknown Object')
+        with pytest.raises(UnknownObjectException):
+            self.repo.get_files()
+
+    def test_get_files_generic_github_exception(self):
+        self.repo._set_target_branch('target')
+        self.repo.files = []
+        self.repo._source_repo = MagicMock()
+        self.repo._source_repo.get_contents.side_effect = GithubException('Generic Exception')
+        with pytest.raises(GithubException):
+            self.repo.get_files()
+
+    def test_create_branch_generic_github_exception_fall_through(self):
+        self.repo._set_target_branch('target')
+        self.repo.files = []
+        self.repo._source_repo = MagicMock()
+        self.repo._source_repo.create_git_ref.side_effect = GithubException('Branch already exists')
+
+        self.repo._make_branch()
+        self.repo._source_repo.create_git_ref.assert_called_once()
+        assert self.repo.branch_exists
+
     def test_set_target_branch(self):
         self.repo._set_target_branch('master')
         self.assertEqual(self.repo.source_branch, 'refs/heads/master')
@@ -113,7 +156,29 @@ class TestRepo(unittest.TestCase):
         repo._source_repo.owner.login = 'someone'
         repo.branch_name = 'branch'
         pr = repo.create_pr('test', '', 'target_branch', ['test'])
-        repo._target_repo.create_pull.assert_called_once_with('test', '', 'target_branch', 'someone:branch')
+        repo._target_repo.create_pull.assert_called_once_with(title='test', body='', base='target_branch', head='someone:branch', draft=False)
+        pr.set_labels.assert_called_once_with('test')
+        repo._source_repo.create_pull.assert_not_called()
+
+    def test_create_pr_draft(self):
+        repo = Repo('test_repo', branch='', github=self.mock_git)
+        repo._target_repo = MagicMock()
+        repo._source_repo = MagicMock()
+        repo._source_repo.owner.login = 'someone'
+        repo.branch_name = 'branch'
+        pr = repo.create_pr('test', '', 'target_branch', ['test'], draft=True)
+        repo._target_repo.create_pull.assert_called_once_with(title='test', body='', base='target_branch', head='someone:branch', draft=True)
+        pr.set_labels.assert_called_once_with('test')
+        repo._source_repo.create_pull.assert_not_called()
+
+    def test_create_pr_named_arguments(self):
+        repo = Repo('test_repo', branch='', github=self.mock_git)
+        repo._target_repo = MagicMock()
+        repo._source_repo = MagicMock()
+        repo._source_repo.owner.login = 'someone'
+        repo.branch_name = 'branch'
+        pr = repo.create_pr(pr_message='test', pr_body='', target_branch='target_branch', labels=['test'], draft=True)
+        repo._target_repo.create_pull.assert_called_once_with(title='test', body='', base='target_branch', head='someone:branch', draft=True)
         pr.set_labels.assert_called_once_with('test')
         repo._source_repo.create_pull.assert_not_called()
 
@@ -124,7 +189,7 @@ class TestRepo(unittest.TestCase):
         repo._source_repo.owner.login = 'someone'
         repo.branch_name = 'branch'
         pr = repo.create_pr('test', '', 'target_branch')
-        repo._target_repo.create_pull.assert_called_once_with('test', '', 'target_branch', 'someone:branch')
+        repo._target_repo.create_pull.assert_called_once_with(title='test', body='', base='target_branch', head='someone:branch', draft=False)
         pr.set_labels.assert_not_called()
         repo._source_repo.create_pull.assert_not_called()
 
@@ -155,14 +220,14 @@ class TestRepo(unittest.TestCase):
     @patch('gordian.repo.Github')
     def test_init_with_passed_token(self, mock_git):
         Repo('test_repo', token='abcdef')
-        args = {'login_or_token': 'abcdef', 'base_url': 'https://api.github.com', 'lazy':False}
+        args = {'login_or_token': 'abcdef', 'base_url': 'https://api.github.com', 'lazy':False, 'pool_size':None}
         mock_git.assert_called_with(**args)
 
     @patch.dict(os.environ, {'GIT_TOKEN': '12345'})
     @patch('gordian.repo.Github')
     def test_init_with_token_from_env(self, mock_git):
         Repo('test_repo')
-        args = {'login_or_token': '12345', 'base_url': 'https://api.github.com', 'lazy':False}
+        args = {'login_or_token': '12345', 'base_url': 'https://api.github.com', 'lazy':False, 'pool_size':None}
 
         mock_git.assert_called_with(**args)
 
@@ -170,7 +235,7 @@ class TestRepo(unittest.TestCase):
     @patch('gordian.repo.Github')
     def test_init_with_user_pass_env(self, mock_git):
         Repo('test_repo')
-        args = {'login_or_token':'test-user', 'password':'test-pass', 'base_url': 'https://api.github.com', 'lazy':False}
+        args = {'login_or_token':'test-user', 'password':'test-pass', 'base_url': 'https://api.github.com', 'lazy':False, 'pool_size':None}
 
         mock_git.assert_called_with(**args)
 
@@ -206,7 +271,7 @@ class TestRepo(unittest.TestCase):
 
         self.assertIsNotNone(repo.get_github_client())
         self.assertEqual(repo.get_github_client(), self.mock_git)
-    
+
     def test_get_repo_contents_timeout_error(self):
         self.repo._set_target_branch('target')
         self.repo.files = []
@@ -217,7 +282,7 @@ class TestRepo(unittest.TestCase):
         assert "Read Timeout" in str(context.value)
         self.repo._source_repo.get_contents.assert_has_calls([call('test/afile.txt', 'target'), call('test/afile.txt', 'target'), call('test/afile.txt', 'target')])
 
-    
+
     def test_get_repo_contents(self):
         self.repo._set_target_branch('target')
         self.repo.files = []

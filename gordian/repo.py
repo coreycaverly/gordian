@@ -1,5 +1,4 @@
-from github import Github
-from github import GithubException
+from github import Github, GithubException, BadCredentialsException, RateLimitExceededException, UnknownObjectException
 import datetime
 import logging
 import os
@@ -14,7 +13,7 @@ BASE_URL = 'https://api.github.com'
 
 class Repo:
 
-    def __init__(self, repo_name, github_api_url=None, branch=None, github=None, files=None, semver_label=None, target_branch='master', fork=False, token=None, username=None, password=None, lazy=False):
+    def __init__(self, repo_name, github_api_url=None, branch=None, github=None, files=None, semver_label=None, target_branch='master', fork=False, token=None, username=None, password=None, lazy=False, pool_size=None):
         if github_api_url is None:
             self.github_api_url = BASE_URL
         else:
@@ -29,10 +28,10 @@ class Repo:
 
             if token:
                 logger.debug('Using git token for authentication')
-                self._github = Github(base_url=self.github_api_url, login_or_token=token, lazy=lazy)
+                self._github = Github(base_url=self.github_api_url, login_or_token=token, lazy=lazy, pool_size=pool_size)
             else:
                 logger.debug('Using git username and password for authentication')
-                self._github = Github(base_url=self.github_api_url, login_or_token=username, password=password, lazy=lazy)
+                self._github = Github(base_url=self.github_api_url, login_or_token=username, password=password, lazy=lazy, pool_size=pool_size)
 
         if files is None:
             files = []
@@ -126,15 +125,26 @@ class Repo:
             self.branch_name = f"refs/heads/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S.%f')}"
             self.source_branch = self.target_ref
 
-    @retry((GithubException, TimeoutError), tries=3, delay=1, backoff=2)
+    @retry((GithubException, TimeoutError, RateLimitExceededException), tries=3, delay=1, backoff=2)
     def _get_repo_contents(self, path):
         try:
             logger.debug(f'Fetching repo contents {path}...')
             return self._source_repo.get_contents(path, self.target_branch)
+
+        # https://docs.github.com/en/rest/repos/contents?apiVersion=2022-11-28#get-repository-content--status-codes
+        except BadCredentialsException as e:
+            logger.info(f'Error fetching repo contents due to bad credentials: {e}')
+            raise e
+        except RateLimitExceededException as e:
+            logger.info(f'Error fetching repo contents due to rate limit: {e}')
+            raise e
+        except UnknownObjectException as e:
+            logger.info(f'Error fetching repo contents due to unknown object: {e}')
+            raise e
         except GithubException as e:
-            if e.status == 404:
-                raise e
+            # generic catch all for any other github exceptions
             logger.info(f'Error fetching repo contents: {e}')
+            raise e
         except TimeoutError as e:
             logger.info(f'Error fetching repo contents: {e}')
             raise e
@@ -221,12 +231,14 @@ class Repo:
             branch=self.branch_name
         )
 
-    def create_pr(self, pr_message, pr_body, target_branch, labels=[]):
+    def create_pr(self, pr_message, pr_body, target_branch, labels=[], draft=False):
+        # https://github.com/PyGithub/PyGithub/blob/v2.8.1/github/Repository.py#L1822 , we need to stay in-line with the PyGithub library
         pr = self._target_repo.create_pull(
-            pr_message,
-            pr_body,
-            target_branch,
-            f'{self._source_repo.owner.login}:{self.branch_name}'
+            title=pr_message,
+            body=pr_body,
+            base=target_branch,
+            head=f'{self._source_repo.owner.login}:{self.branch_name}',
+            draft=draft
         )
         if labels:
             pr.set_labels(*labels)
